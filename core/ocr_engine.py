@@ -1,91 +1,131 @@
 import cv2
-import easyocr
-import time
-import re
 import numpy as np
+import torch
+import re
+from PIL import Image
+from ultralytics import YOLO
+from transformers import TrOCRProcessor, VisionEncoderDecoderModel
 
 
-class LicensePlateRecognizer:
-    def __init__(self, use_gpu=False):
-        print("Ładowanie modelu EasyOCR (High Quality Mode)...")
-        # Na Macu M4 'gpu=False' oznacza użycie CPU, które jest potwornie szybkie.
-        # 'gpu=True' wymagałoby specjalnej konfiguracji torch-mps,
-        # ale CPU M4 spokojnie zrobi to w ułamku sekundy.
-        self.reader = easyocr.Reader(['en'], gpu=False)
-        print("Model załadowany.")
+class OCREngine:
+    def __init__(self, yolo_path='best.pt', trocr_model_name='microsoft/trocr-base-printed'):
+        # 1. Wybór urządzenia (MPS dla Apple Silicon to game changer)
+        self.device = "mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"🚀 Inicjalizacja OCREngine na: {self.device.upper()}")
 
-    def preprocess_image(self, image):
-        if image is None:
-            return None
+        # 2. Ładowanie YOLO
+        print(f"   -> Ładowanie YOLO: {yolo_path}")
+        self.yolo = YOLO(yolo_path)
 
-        # --- KONFIGURACJA POD JAKOŚĆ (Dla M4) ---
+        # 3. Ładowanie TrOCR
+        print(f"   -> Ładowanie TrOCR: {trocr_model_name}")
+        self.processor = TrOCRProcessor.from_pretrained(trocr_model_name)
+        self.trocr = VisionEncoderDecoderModel.from_pretrained(trocr_model_name).to(self.device)
 
-        # 1. Resize - Ale teraz celujemy w wysoką jakość.
-        # Szerokość 1600px pozwoli precyzyjnie odczytać litery.
-        target_width = 1600
-        h, w = image.shape[:2]
+        print("✅ Silnik gotowy do pracy.")
 
-        if w > target_width:
-            scale = target_width / w
-            image = cv2.resize(image, (int(target_width), int(h * scale)), interpolation=cv2.INTER_AREA)
+    def preprocess_crop(self, crop):
+        """Konwersja OpenCV (BGR) -> PIL (RGB) dla TrOCR"""
+        rgb_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+        return Image.fromarray(rgb_crop)
 
-        # 2. Skala szarości
-        img_gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    def run_ocr_on_crop(self, pil_image):
+        """Samo rozpoznawanie tekstu na wycinku"""
+        pixel_values = self.processor(images=pil_image, return_tensors="pt").pixel_values.to(self.device)
 
-        # 3. Obustronny filtr (Bilateral Filter)
-        # Usuwa szum, ale zachowuje krawędzie liter (lepiej niż zwykły blur).
-        # Jest wolniejszy, ale M4 to udźwignie.
-        img_denoised = cv2.bilateralFilter(img_gray, 11, 17, 17)
+        with torch.no_grad():
+            generated_ids = self.trocr.generate(pixel_values)
+            generated_text = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
 
-        # 4. Adaptacyjny próg (Adaptive Threshold) lub CLAHE
-        # CLAHE (Contrast Limited Adaptive Histogram Equalization) świetnie wyciąga detale.
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        img_contrasted = clahe.apply(img_denoised)
+        return generated_text
 
-        return img_contrasted
+    def clean_and_fix(self, text):
+        """Nasza zwycięska logika naprawiania błędów (Regex + Mapowanie)"""
+        if not text: return ""
 
-    def clean_text(self, text):
-        # Tylko duże litery i cyfry
-        return re.sub(r'[^A-Z0-9]', '', text.upper())
+        # Wstępne czyszczenie
+        text = text.upper().replace(' ', '').replace('-', '').replace('.', '').replace(':', '')
+        if text.startswith("PL"): text = text[2:]
 
-    def analyze_image(self, image_path):
-        start_time = time.time()
+        # REGEX SNAJPERSKI (Wyciąga rdzeń numeru)
+        match = re.search(r'([A-Z]{2,3}[0-9]{2,5}[A-Z0-9]*)', text)
+        if match:
+            text = match.group(1)[:8]
+        else:
+            text = re.sub(r'[^A-Z0-9]', '', text)[:8]
 
-        img = cv2.imread(image_path)
-        if img is None:
-            return None, 0.0, 0.0
+        t = list(text)
+        if len(t) < 4: return text
 
-        processed_img = self.preprocess_image(img)
+        # Słowniki pomyłek
+        to_digit = {'O': '0', 'I': '1', 'Z': '2', 'B': '8', 'S': '5', 'D': '0'}
+        to_char = {'0': 'O', '1': 'I', '2': 'Z', '8': 'B', '5': 'S'}
 
-        # allowlist - blokujemy śmieci.
-        results = self.reader.readtext(
-            processed_img,
-            detail=1,
-            allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
-        )
+        # 1. Prefiks (2 pierwsze znaki) -> Litery
+        for i in range(min(2, len(t))):
+            if t[i] in to_char: t[i] = to_char[t[i]]
 
-        best_text = ""
-        best_conf = 0.0
+        # 2. Logika 3 znaków (Powiat 3-literowy lub Śląsk)
+        prefix_len = 2
+        if len(t) > 2:
+            c3 = t[2]
+            is_letter = c3.isalpha() and c3 not in ['Z', 'I', 'O', 'B']
+            is_silesia = (t[0] == 'S' and c3 in ['Z', 'R', 'C', 'M', 'T', 'B', 'K', 'L', 'I'])
 
-        for (bbox, text, conf) in results:
-            cleaned = self.clean_text(text)
+            if is_letter or is_silesia:
+                prefix_len = 3
+                if t[2] in to_char: t[2] = to_char[t[2]]
+            else:
+                if t[2] in to_digit: t[2] = to_digit[t[2]]
 
-            # Polskie tablice: 7-8 znaków, ale szukamy szerzej 5-9
-            if 5 <= len(cleaned) <= 9:
-                # Logika punktacji: Długość ma znaczenie.
-                # Preferujemy ciągi 7-8 znakowe nawet z nieco mniejszą pewnością
-                # niż krótkie 5-znakowe "pewniaki" (często błędy).
+        # 3. Reszta -> Cyfry (z wyjątkami na końcu)
+        for i in range(prefix_len, len(t)):
+            is_last = (i == len(t) - 1)
+            if not is_last:
+                if t[i] in to_digit: t[i] = to_digit[t[i]]
+                if t[i] == 'Z': t[i] = '2'
+                if t[i] == 'S': t[i] = '5'
+            else:
+                if t[i] == 'Q': t[i] = '0'
+                if t[i] == '1' and t[i - 1] == '6': t[i] = 'T'
 
-                # Bonus punktowy za idealną długość tablicy (7 lub 8 znaków)
-                score = conf
-                if len(cleaned) == 7 or len(cleaned) == 8:
-                    score += 0.2  # Promujemy poprawne długości
+        return "".join(t)
 
-                if score > best_conf:
-                    best_conf = score  # Zapisujemy score jako "conf" dla porównania
-                    best_text = cleaned
-                    # Przywracamy prawdziwą pewność do zmiennej conf (dla outputu)
-                    best_conf = conf
+    def process_frame(self, frame):
+        """
+        Główna metoda: Klatka -> YOLO -> Wycięcie -> TrOCR -> Wynik
+        Zwraca: (detected_text, confidence, bbox) lub (None, 0, None)
+        """
+        # 1. Detekcja YOLO
+        results = self.yolo.predict(frame, conf=0.25, verbose=False)
 
-        process_time = time.time() - start_time
-        return best_text, best_conf, process_time
+        if len(results[0].boxes) == 0:
+            return None, 0, None
+
+        # Pobieramy najlepszy box
+        best_box = results[0].boxes[0]
+        conf = float(best_box.conf[0])
+        x1, y1, x2, y2 = best_box.xyxy[0].cpu().numpy().astype(int)
+
+        # 2. Wycinanie z marginesem (TrOCR lubi kontekst)
+        h_img, w_img = frame.shape[:2]
+        margin = 10
+
+        crop_y1 = max(0, y1 - margin)
+        crop_y2 = min(h_img, y2 + margin)
+        crop_x1 = max(0, x1 - margin)
+        crop_x2 = min(w_img, x2 + margin)
+
+        plate_crop = frame[crop_y1:crop_y2, crop_x1:crop_x2]
+
+        if plate_crop.size == 0:
+            return None, 0, None
+
+        # 3. Rozpoznawanie TrOCR
+        pil_crop = self.preprocess_crop(plate_crop)
+        raw_text = self.run_ocr_on_crop(pil_crop)
+
+        # 4. Naprawa tekstu
+        final_text = self.clean_and_fix(raw_text)
+
+        return final_text, conf, (x1, y1, x2, y2)
