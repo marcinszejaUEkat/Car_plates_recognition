@@ -2,9 +2,8 @@ import os
 import cv2
 import xml.etree.ElementTree as ET
 import time
-from core.ocr_engine import OCREngine  # Importujemy naszą nową klasę
+from core.ocr_engine import OCREngine
 
-# --- KONFIGURACJA ---
 IMAGES_DIR = 'Data'
 ANNOTATIONS_FILE = 'annotations.xml'
 
@@ -19,14 +18,11 @@ def main():
         print("Brak folderu Data lub pliku XML.")
         return
 
-    # 1. Inicjalizacja Silnika (ładuje modele raz)
     engine = OCREngine(yolo_path='best.pt')
 
-    # 2. Przygotowanie listy plików z XML
     tree = ET.parse(ANNOTATIONS_FILE)
     root = tree.getroot()
     images = root.findall('image')
-    # Sortowanie numeryczne
     images.sort(key=lambda x: int(''.join(filter(str.isdigit, x.get('name')))) if any(
         c.isdigit() for c in x.get('name')) else 0)
 
@@ -44,7 +40,6 @@ def main():
 
         if not os.path.exists(file_path): continue
 
-        # Pobieramy oczekiwany wynik z XML dla porównania
         box = image_tag.find('box')
         if box is None: continue
         attr = box.find("attribute[@name='plate number']")
@@ -54,16 +49,12 @@ def main():
         img = cv2.imread(file_path)
         if img is None: continue
 
-        # --- UŻYCIE SILNIKA ---
-        # To jest jedyna linijka, którą musisz wywołać w aplikacji głównej!
         detected_text, conf, bbox = engine.process_frame(img)
 
-        # Logika wyświetlania
         if detected_text is None:
             detected_text = "---"
             status = "🚫 (YOLO)"
         else:
-            # Porównanie (ignorując O/0)
             norm_res = detected_text.replace('0', '#').replace('O', '#')
             norm_exp = expected.replace('0', '#').replace('O', '#')
 
