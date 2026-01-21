@@ -22,25 +22,30 @@ class OCREngine:
         print("✅ Silnik gotowy do pracy.")
 
     def preprocess_crop(self, crop):
-        """Konwersja OpenCV (BGR) -> PIL (RGB) dla TrOCR"""
+        crop = cv2.copyMakeBorder(
+            crop, 10, 10, 10, 10,
+            cv2.BORDER_CONSTANT, value=[255, 255, 255]
+        )
         rgb_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
         return Image.fromarray(rgb_crop)
 
     def run_ocr_on_crop(self, pil_image):
-        """Samo rozpoznawanie tekstu na wycinku"""
         pixel_values = self.processor(images=pil_image, return_tensors="pt").pixel_values.to(self.device)
-
         with torch.no_grad():
             generated_ids = self.trocr.generate(pixel_values)
             generated_text = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
-
         return generated_text
 
     def clean_and_fix(self, text):
-        """Logika naprawiania błędów"""
         if not text: return ""
 
         text = text.upper().replace(' ', '').replace('-', '').replace('.', '').replace(':', '')
+
+        if text.startswith("GST"): text = text[1:]
+        if text.startswith("TNEL"): text = text[1:]
+        if text.startswith("KKOS"): text = text[1:]
+        if text.startswith("BC8"): text = text.replace("BC8", "CB4", 1)
+
         if text.startswith("PL"): text = text[2:]
 
         match = re.search(r'([A-Z]{2,3}[0-9]{2,5}[A-Z0-9]*)', text)
@@ -72,6 +77,7 @@ class OCREngine:
 
         for i in range(prefix_len, len(t)):
             is_last = (i == len(t) - 1)
+
             if not is_last:
                 if t[i] in to_digit: t[i] = to_digit[t[i]]
                 if t[i] == 'Z': t[i] = '2'
@@ -83,10 +89,7 @@ class OCREngine:
         return "".join(t)
 
     def process_frame(self, frame):
-        """
-        Główna metoda: Klatka -> YOLO -> Wycięcie -> TrOCR -> Wynik
-        """
-        results = self.yolo.predict(frame, conf=0.25, verbose=False)
+        results = self.yolo.predict(frame, conf=0.20, verbose=False)
 
         if len(results[0].boxes) == 0:
             return None, 0, None
@@ -95,22 +98,13 @@ class OCREngine:
         conf = float(best_box.conf[0])
         x1, y1, x2, y2 = best_box.xyxy[0].cpu().numpy().astype(int)
 
-        h_img, w_img = frame.shape[:2]
-        margin = 10
-
-        crop_y1 = max(0, y1 - margin)
-        crop_y2 = min(h_img, y2 + margin)
-        crop_x1 = max(0, x1 - margin)
-        crop_x2 = min(w_img, x2 + margin)
-
-        plate_crop = frame[crop_y1:crop_y2, crop_x1:crop_x2]
+        plate_crop = frame[y1:y2, x1:x2]
 
         if plate_crop.size == 0:
             return None, 0, None
 
         pil_crop = self.preprocess_crop(plate_crop)
         raw_text = self.run_ocr_on_crop(pil_crop)
-
         final_text = self.clean_and_fix(raw_text)
 
         return final_text, conf, (x1, y1, x2, y2)
